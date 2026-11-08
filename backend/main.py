@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from pyproj import Geod
 from rasterio.windows import Window, from_bounds
+from rasterio.transform import from_origin
+from rasterio.warp import reproject, Resampling
 from skimage.measure import find_contours
 
 app = FastAPI(title='GeoExport elevation adapter', docs_url=None, redoc_url=None)
@@ -27,6 +29,9 @@ class ElevationRequest(BaseModel):
         area, _ = _geod.polygon_area_perimeter([west,east,east,west], [south,south,north,north])
         if abs(area) > 1_000_000:
             raise ValueError('Obszar przekracza limit 1 km²')
+        tile_count = (math.ceil(east) - math.floor(west)) * (math.ceil(north) - math.floor(south))
+        if tile_count > 16:
+            raise ValueError('Obszar przecina zbyt wiele kafli DEM (maksymalnie 16)')
         return self
 
 def tile_url(lat: int, lon: int) -> str:
@@ -36,19 +41,67 @@ def tile_url(lat: int, lon: int) -> str:
     return f'https://copernicus-dem-30m.s3.amazonaws.com/{name}/{name}.tif'
 
 def read_window(url, bounds):
-    # GDAL reads only the intersecting window of the public cloud-optimized GeoTIFF.
+    # Read a small padded window so resampling near tile and selection edges has data.
     with rasterio.Env(GDAL_HTTP_TIMEOUT='30', GDAL_HTTP_CONNECTTIMEOUT='10', GDAL_DISABLE_READDIR_ON_OPEN='EMPTY_DIR', CPL_VSIL_CURL_ALLOWED_EXTENSIONS='.tif'):
         with rasterio.open(url) as ds:
-            requested = from_bounds(*bounds, transform=ds.transform).round_offsets().round_lengths()
-            window = requested.intersection(Window(0, 0, ds.width, ds.height))
-            if window.width < 2 or window.height < 2:
+            if ds.crs is None or ds.crs.to_epsg() != 4326:
+                raise ValueError('Nieoczekiwany układ współrzędnych kafla DEM')
+            raw = from_bounds(*bounds, transform=ds.transform)
+            col0 = max(0, math.floor(raw.col_off) - 1)
+            row0 = max(0, math.floor(raw.row_off) - 1)
+            col1 = min(ds.width, math.ceil(raw.col_off + raw.width) + 1)
+            row1 = min(ds.height, math.ceil(raw.row_off + raw.height) + 1)
+            if col1 <= col0 or row1 <= row0:
                 return None
+            window = Window(col0, row0, col1-col0, row1-row0)
+            if window.width * window.height > 150000:
+                raise ValueError('Siatka terenu jest zbyt duża')
             return ds.read(1, window=window, masked=True), ds.window_transform(window)
+
+def read_dem_mosaic(bounds):
+    """Combine intersecting COG windows onto a single WGS84 grid without filling nodata."""
+    west, south, east, north = bounds
+    grids, tiles = [], []
+    for lat in range(math.floor(south), math.ceil(north)):
+        for lon in range(math.floor(west), math.ceil(east)):
+            url = tile_url(lat, lon)
+            part = (max(west, lon), max(south, lat), min(east, lon+1), min(north, lat+1))
+            grid = read_window(url, part)
+            if grid is None:
+                raise ValueError('Brak danych w jednym z kafli DEM')
+            grids.append(grid)
+            tiles.append(url)
+    if not grids:
+        raise ValueError('Brak kafli DEM dla wybranego obszaru')
+    # At the equator and near latitude-band transitions COG pixel widths may differ.
+    # Use the finest resolution among the source tiles, nearest-neighbour sampling.
+    res_x = min(abs(transform.a) for _, transform in grids)
+    res_y = min(abs(transform.e) for _, transform in grids)
+    if not (math.isfinite(res_x) and math.isfinite(res_y) and res_x > 0 and res_y > 0):
+        raise ValueError('Niepoprawna rozdzielczość DEM')
+    width, height = max(1, math.ceil((east-west)/res_x - 1e-9)), max(1, math.ceil((north-south)/res_y - 1e-9))
+    if width * height > 100000 or max(width, height) > 100000:
+        raise ValueError('Siatka terenu jest zbyt duża')
+    target_transform = from_origin(west, north, res_x, res_y)
+    mosaic = np.full((height, width), np.nan, dtype=np.float32)
+    for data, transform in grids:
+        values = np.ma.asarray(data, dtype=np.float32).filled(np.nan)
+        temp = np.full_like(mosaic, np.nan)
+        reproject(values, temp, src_transform=transform, src_crs='EPSG:4326', src_nodata=np.nan,
+                  dst_transform=target_transform, dst_crs='EPSG:4326', dst_nodata=np.nan,
+                  resampling=Resampling.nearest)
+        valid = np.isfinite(temp)
+        mosaic[valid] = temp[valid]
+    if not np.isfinite(mosaic).any():
+        raise ValueError('Brak poprawnych danych DEM w obszarze')
+    return np.ma.masked_invalid(mosaic), target_transform, tiles
 
 def contours_from_grid(data, transform, interval):
     values = np.ma.asarray(data, dtype=float).filled(np.nan)
     if not np.isfinite(values).any():
         return []
+    if min(values.shape) < 2:
+        raise ValueError('Zbyt mały obszar do wyznaczenia poziomic z tej siatki DEM')
     low, high = float(np.nanmin(values)), float(np.nanmax(values))
     first = math.ceil(low / interval)
     last = math.floor(high / interval)
@@ -61,7 +114,7 @@ def contours_from_grid(data, transform, interval):
             if len(line) < 2:
                 continue
             # find_contours returns row/column in pixel-center coordinates.
-            coordinates = [list(transform * (float(col) + 0.5, float(row) + 0.5)) for row, col in line]
+            coordinates = [list(transform @ (float(col) + 0.5, float(row) + 0.5)) for row, col in line]
             features.append({'type': 'Feature', 'geometry': {'type': 'LineString', 'coordinates': coordinates},
                              'properties': {'layer': 'contours', 'elevation_m': round(level, 4), 'source': 'Copernicus DEM GLO-30'}})
     return features
@@ -71,23 +124,17 @@ def elevation_contours(request: ElevationRequest):
     if not _slots.acquire(blocking=False):
         raise HTTPException(429, 'Serwer jest zajęty. Spróbuj ponownie później.')
     try:
-        west, south, east, north = request.bounds
-        features, tiles = [], []
-        for lat in range(math.floor(south), math.ceil(north)):
-            for lon in range(math.floor(west), math.ceil(east)):
-                url = tile_url(lat, lon)
-                bounds = (max(west, lon), max(south, lat), min(east, lon+1), min(north, lat+1))
-                grid = read_window(url, bounds)
-                if grid is not None:
-                    features.extend(contours_from_grid(*grid, request.interval))
-                tiles.append(url)
+        data, transform, tiles = read_dem_mosaic(request.bounds)
+        features = contours_from_grid(data, transform, request.interval)
         return {'type': 'FeatureCollection', 'features': features, 'metadata': {
             'source': 'Copernicus DEM GLO-30', 'model_type': 'DSM', 'resolution': 'approximately 30 m',
             'attribution': f'Contains modified Copernicus DEM data {datetime.now(timezone.utc).year}',
             'license_url': 'https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM',
             'retrieved_at': datetime.now(timezone.utc).isoformat(), 'tiles': tiles,
-            'interval_m': request.interval,
+            'interval_m': request.interval, 'nodata_pixels': int(np.ma.count_masked(data)),
             'warning': 'Model powierzchni (DSM), nie NMT. Rozdzielczość około 30 m; poziomice są poglądowe i nie zastępują pomiarów terenowych.'}}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
         # Fail the elevation layer explicitly rather than fabricate data.
         raise HTTPException(502, 'Nie można pobrać lub przetworzyć kafla Copernicus DEM. Spróbuj ponownie później.') from exc
@@ -314,12 +361,7 @@ def building_height(properties):
 
 def make_model(request):
     west, south, east, north = request.bounds
-    if math.floor(west) != math.floor(east - 1e-12) or math.floor(south) != math.floor(north - 1e-12):
-        raise ValueError('Model 3D przekracza granicę kafla DEM; wybierz mniejszy obszar.')
-    tile = tile_url(math.floor(south), math.floor(west))
-    grid = read_window(tile, request.bounds)
-    if grid is None: raise ValueError('Brak danych wysokościowych w wybranym obszarze.')
-    data, affine = grid
+    data, affine, tiles = read_dem_mosaic(request.bounds)
     arr = np.ma.asarray(data, dtype=float).filled(np.nan)
     if arr.shape[0] < 2 or arr.shape[1] < 2 or not np.isfinite(arr).any(): raise ValueError('Niewystarczające dane wysokościowe.')
     if arr.shape[0] * arr.shape[1] > 100000: raise ValueError('Siatka terenu jest zbyt duża.')
@@ -329,7 +371,7 @@ def make_model(request):
     vertices = []
     for row in range(arr.shape[0]):
         for col in range(arr.shape[1]):
-            lon, lat = affine * (col+.5, row+.5)
+            lon, lat = affine @ (col+.5, row+.5)
             x, y = transformer.transform(lon, lat, errcheck=True)
             value = arr[row,col]
             vertices.append((x-origin_x, y-origin_y, float(value-base_z) if np.isfinite(value) else 0))
@@ -364,7 +406,7 @@ def make_model(request):
                 shape=Polygon(project(poly[0]), [project(r) for r in poly[1:]])
                 if not shape.is_valid or shape.is_empty or shape.area <= 0: raise ValueError('Niepoprawny obrys')
                 # A DSM sample is only an approximation, not a true ground level.
-                lon,lat=poly[0][0][:2]; col,row=(~affine) * (float(lon),float(lat))
+                lon,lat=poly[0][0][:2]; col,row=(~affine) @ (float(lon),float(lat))
                 rr=max(0,min(rows-1,int(row))); cc=max(0,min(cols-1,int(col)))
                 z=float(arr[rr,cc]-base_z) if np.isfinite(arr[rr,cc]) else 0
                 height, assumed=building_height(props)
@@ -375,9 +417,9 @@ def make_model(request):
             warnings.append(f'Budynek {i}: {str(exc)[:120]}')
     metadata={'source':'OpenStreetMap and Copernicus DEM GLO-30', 'attribution':'© OpenStreetMap contributors; Contains modified Copernicus DEM data',
               'licenses':['https://www.openstreetmap.org/copyright','https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM'],
-              'crs':request.crs, 'units':'meters', 'local_origin_easting_northing': [origin_x,origin_y], 'vertical_origin_m':base_z,
+              'crs':request.crs, 'units':'meters', 'axes': ('X=east, Y=up, Z=south' if request.format == 'glTF' else 'X=east, Y=north, Z=up'), 'local_origin_easting_northing': [origin_x,origin_y], 'vertical_origin_m':base_z,
               'data_timestamp':request.collection.get('metadata',{}).get('data_timestamp'), 'retrieved_at':datetime.now(timezone.utc).isoformat(),
-              'dem_tile':tile, 'buildings':building_count,'estimated_building_heights':estimated,'warnings':warnings,
+              'dem_tiles':tiles, 'dem_nodata_pixels':int(np.ma.count_masked(data)), 'buildings':building_count,'estimated_building_heights':estimated,'warnings':warnings,
               'disclaimer':'DEM is a surface model (DSM), not bare earth. Building elevations and fallback heights are approximate; not for surveying.'}
     memory=BytesIO()
     with zipfile.ZipFile(memory,'w',zipfile.ZIP_DEFLATED) as archive:
@@ -385,6 +427,8 @@ def make_model(request):
             obj=trimesh.exchange.obj.export_obj(scene)
             archive.writestr('model.obj', '# © OpenStreetMap contributors, ODbL; Contains modified Copernicus DEM data\n# Metadata: metadata.json\n'+obj)
         else:
+            # glTF uses a right-handed, Y-up coordinate system; OBJ stays Z-up.
+            scene.apply_transform([[1,0,0,0],[0,0,1,0],[0,-1,0,0],[0,0,0,1]])
             def add_attribution(tree):
                 tree.setdefault('asset', {})['copyright'] = metadata['attribution']
                 tree.setdefault('asset', {})['extras'] = {'license_urls': metadata['licenses'], 'metadata_file':'metadata.json'}
@@ -415,19 +459,13 @@ async def export_model(request: Request):
 def export_geotiff(data: ElevationRequest):
     if not _slots.acquire(blocking=False): raise HTTPException(429,'Serwer jest zajęty')
     try:
-        west,south,east,north=data.bounds
-        if math.floor(west) != math.floor(east-1e-12) or math.floor(south) != math.floor(north-1e-12):
-            raise HTTPException(422,'Obszar przekracza granicę kafla DEM; wybierz mniejszy obszar.')
-        tile=tile_url(math.floor(south),math.floor(west))
-        grid=read_window(tile,data.bounds)
-        if grid is None: raise HTTPException(422,'Brak danych wysokościowych.')
-        raster,transform=grid
+        raster,transform,tiles = read_dem_mosaic(data.bounds)
         if raster.size>100000 or np.ma.count(raster)==0: raise HTTPException(422,'Niepoprawna lub zbyt duża siatka DEM.')
         from rasterio.io import MemoryFile
         with MemoryFile() as memory:
             with memory.open(driver='GTiff',height=raster.shape[0],width=raster.shape[1],count=1,dtype='float32',crs='EPSG:4326',transform=transform,nodata=-9999,compress='deflate') as dst:
                 dst.write(np.ma.asarray(raster,dtype='float32').filled(-9999),1)
-                dst.update_tags(source='Copernicus DEM GLO-30', attribution=f'Contains modified Copernicus DEM data {datetime.now(timezone.utc).year}', license='https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM', retrieved_at=datetime.now(timezone.utc).isoformat(), source_tile=tile, description='DSM, not bare-earth DTM; approximate 30m resolution; not for surveying')
+                dst.update_tags(source='Copernicus DEM GLO-30', attribution=f'Contains modified Copernicus DEM data {datetime.now(timezone.utc).year}', license='https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM', retrieved_at=datetime.now(timezone.utc).isoformat(), source_tiles=json.dumps(tiles), nodata_pixels=str(np.ma.count_masked(raster)), description='DSM, not bare-earth DTM; approximate 30m resolution; not for surveying')
             return Response(memory.read(),media_type='image/tiff',headers={'Content-Disposition':'attachment; filename="geoexport-dem.tif"'})
     except HTTPException: raise
     except Exception as exc: raise HTTPException(502,'Nie udało się pobrać danych Copernicus DEM.') from exc
