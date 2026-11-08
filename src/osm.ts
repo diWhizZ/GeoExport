@@ -14,7 +14,16 @@ const filters: Record<string, string[]> = {
 /** Public Overpass instance: convenience for the prototype, not a production SLA. */
 export async function fetchOsm(bounds: Bounds, layerIds: string[], signal?: AbortSignal) {
   const available = layerIds.filter(id => filters[id]);
-  if (!available.length) throw new Error('Wybierz co najmniej jedną warstwę OSM.');
+  if (!available.length) {
+    if (!layerIds.includes('contours')) throw new Error('Wybierz co najmniej jedną warstwę.');
+    return {type: 'FeatureCollection' as const, features: [] as Feature<Geometry>[], metadata: {
+      source: 'No OSM data requested', attribution: '© OpenStreetMap contributors',
+      license: 'ODbL 1.0', license_url: 'https://www.openstreetmap.org/copyright',
+      retrieved_at: new Date().toISOString(), data_timestamp: null as string | null,
+      bounds_wgs84: bounds, layers: [] as string[], omitted_layers: ['contours'], warnings: [] as string[],
+      disclaimer: 'Dane poglądowe; nie zastępują pomiarów geodezyjnych.',
+    }};
+  }
   const bbox = `${bounds[1]},${bounds[0]},${bounds[3]},${bounds[2]}`;
   const queries = available.flatMap(id => filters[id].map(filter => `nwr${filter}(${bbox});`)).join('');
   const query = `[out:json][timeout:50];(${queries});out body;>;out skel qt;`;

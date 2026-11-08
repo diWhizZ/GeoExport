@@ -25,7 +25,12 @@ describe('adapter Overpass', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ok:true, json:async()=>({remark:'runtime error'})}));
     await expect(fetchOsm([21,52,21.01,52.01], ['buildings'])).rejects.toThrow('runtime error');
   });
-  it('requires a supported layer', async () => {
-    await expect(fetchOsm([21,52,21.01,52.01], ['contours'])).rejects.toThrow('warstwę OSM');
+  it('supports contours alone without issuing an OSM request', async () => {
+    const mock=vi.fn();vi.stubGlobal('fetch',mock);
+    const result=await fetchOsm([21,52,21.01,52.01], ['contours']);
+    expect(result.features).toEqual([]);expect(result.metadata.omitted_layers).toEqual(['contours']);expect(mock).not.toHaveBeenCalled();
+  });
+  it('requires at least one layer', async () => {
+    await expect(fetchOsm([21,52,21.01,52.01], [])).rejects.toThrow('co najmniej jedną warstwę');
   });
 });
